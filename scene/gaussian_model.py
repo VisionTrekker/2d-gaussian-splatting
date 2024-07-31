@@ -124,26 +124,28 @@ class GaussianModel:
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())   # (N, 3)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # (N, 3, (最大球谐阶数 + 1)²)
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)    # 初始化2D高斯在两个方向上的缩放因子为 该点与其K个最近邻点的平均距离 (N, 2)
+        # 初始化2D高斯的旋转四元数 为[0,1]的均匀分布，3DGS是无旋转的单位四元数 (N, 4)
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
-
+        # 初始化各2D高斯的 不透明度为0.1 (N, 1)
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # 将以上需计算的参数设置为模型的可训练参数
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))    # 各2D高斯的中心位置，(N, 3)
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))   # 球谐函数直流分量的系数，(N, 1, 3)
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))  # 球谐函数高阶分量的系数，(N, (最大球谐阶数 + 1)² - 1, 3)
+        self._scaling = nn.Parameter(scales.requires_grad_(True))   # 缩放因子，(N, 2)
+        self._rotation = nn.Parameter(rots.requires_grad_(True))    # 0,1均匀分布的旋转四元数，(N, 4)
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))    # 不透明度，(N, 1)
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")  # 投影到所有2D图像平面上的最大半径，初始化为0，(N, )
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense

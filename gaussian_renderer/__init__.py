@@ -107,6 +107,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
+    # 视锥体外的或半径为0的高斯体 在当前相机视角下是不可见的，它们将被排除在增稠中的分裂条件中使用的值更新之外。
     rets =  {"render": rendered_image,
             "viewspace_points": means2D,
             "visibility_filter" : radii > 0,
@@ -118,41 +119,40 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     render_alpha = allmap[1:2]
 
     # get normal map
-    # transform normal from view space to world space
-    render_normal = allmap[2:5]
-    render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)
+    # 渲染的法向量图，并将其从相机坐标系转换到世界坐标系中，transform normal from view space to world space
+    render_normal = allmap[2:5] # 3 H W
+    render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)    # H W 3 @ 3 3 = H W 3 ==> 3 H W
     
-    # get median depth map
-    render_depth_median = allmap[5:6]
+    # 渲染的中值深度图，get median depth map
+    render_depth_median = allmap[5:6]   # 1 H W
     render_depth_median = torch.nan_to_num(render_depth_median, 0, 0)
 
-    # get expected depth map
+    # 期望的深度图，使用不透明度归一化，get expected depth map
     render_depth_expected = allmap[0:1]
     render_depth_expected = (render_depth_expected / render_alpha)
     render_depth_expected = torch.nan_to_num(render_depth_expected, 0, 0)
     
-    # get depth distortion map
+    # 与光线相交的2D高斯与2D高斯之间的距离，get depth distortion map
     render_dist = allmap[6:7]
 
-    # psedo surface attributes
-    # surf depth is either median or expected by setting depth_ratio to 1 or 0
-    # for bounded scene, use median depth, i.e., depth_ratio = 1; 
-    # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
+    # 伪表面深度图surf depth：由设置的depth_ratio决定：1是中值深度，0是期望深度
+    # 有界场景(TnT、DTU)，depth_ratio = 1，使用中值深度
+    # 无边界场景(MipNeRF360)，depth_ratio = 0，使用期望深度，减少伪影
     surf_depth = render_depth_expected * (1-pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
     
-    # assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
-    surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
-    surf_normal = surf_normal.permute(2,0,1)
-    # remember to multiply with accum_alpha since render_normal is unnormalized.
+    # 假设深度点分布于表面，使用它们生成伪表面法向量，用于正则化
+    surf_normal = depth_to_normal(viewpoint_camera, surf_depth) # 从深度图计算法向量
+    surf_normal = surf_normal.permute(2,0,1)    # 3 H W
+    # 记得乘以累加权重accum_alpha，因为render_normal未归一化
     surf_normal = surf_normal * (render_alpha).detach()
 
 
     rets.update({
             'rend_alpha': render_alpha,
             'rend_normal': render_normal,
-            'rend_dist': render_dist,
-            'surf_depth': surf_depth,
-            'surf_normal': surf_normal,
+            'rend_dist': render_dist,   # 与光线相交的2D高斯与2D高斯之间的距离
+            'surf_depth': surf_depth,   # 伪表面深度图
+            'surf_normal': surf_normal, # 由伪表面深度图计算法向量图，3 H W
     })
 
     return rets
