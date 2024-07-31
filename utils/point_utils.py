@@ -25,8 +25,8 @@ def depths_to_points(view, depthmap):
 
 def depth_to_normal(view, depth):
     """
-        view: view camera
-        depth: depthmap 
+        view: 当前相机
+        depth: 伪表面深度图
     """
     points = depths_to_points(view, depth).reshape(*depth.shape[1:], 3)
     output = torch.zeros_like(points)

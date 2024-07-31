@@ -66,7 +66,7 @@ class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
-        self.depth_ratio = 0.0
+        self.depth_ratio = 0.0  # 有界场景(TnT、DTU)为1，伪表面深度使用中值深度；无边界场景(MipNeRF360)为0，使用期望深度，减少伪影
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
 
@@ -83,7 +83,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_dist = 0.0
+        self.lambda_dist = 0.0  # MipNeRF360为0；TnT环绕场景为100，大场景为10；DTU为1000
         self.lambda_normal = 0.05
         self.opacity_cull = 0.05
 
