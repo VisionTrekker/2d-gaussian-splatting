@@ -81,17 +81,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         rend_dist = render_pkg["rend_dist"]
         dist_loss = lambda_dist * (rend_dist).mean()
 
-        rend_normal  = render_pkg['rend_normal']
-        surf_normal = render_pkg['surf_normal']
-        normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
-        normal_loss = lambda_normal * (normal_error).mean()
 
+        rend_normal = render_pkg['rend_normal']    # 渲染的normal
+        surf_normal = render_pkg['surf_normal']    # 从渲染深度图计算的normal
         gt_normal = viewpoint_cam.normal.cuda()
+
+        # 计算渲染的normal与从伪表面深度图计算的normal之间的Loss
+        # normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+        # normal_loss = lambda_normal * (normal_error).mean()
+
+        # 计算从伪表面深度图计算的normal与gt normal之间的loss
+        # normal_error = (1 - (surf_normal * gt_normal).sum(dim=0))[None]
+        # normal_loss = lambda_normal * (normal_error).mean()
+
+        # 计算渲染的normal与gt normal之间的Loss
         gt_normal_error = (1 - (rend_normal * gt_normal).sum(dim=0))[None]
-        gt_normal_loss = lambda_normal * (gt_normal_error).mean()
+        normal_loss = lambda_normal * (gt_normal_error).mean()
 
         # loss
-        total_loss = loss + dist_loss + normal_loss + gt_normal_loss
+        total_loss = loss + dist_loss + normal_loss
         
         total_loss.backward()
 
