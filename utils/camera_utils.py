@@ -48,10 +48,27 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
+    if cam_info.depth is not None:
+        import cv2
+        import torch
+        resized_depth = torch.tensor(cv2.resize(cam_info.depth.squeeze(), resolution, interpolation=cv2.INTER_NEAREST)).to(resized_image_rgb.device)    # H W 1
+    else:
+        resized_depth = None
+
+    if cam_info.normal is not None:
+        import cv2
+        import torch
+        resized_normal = torch.tensor(cv2.resize(cam_info.normal, resolution, interpolation=cv2.INTER_NEAREST)).to(resized_image_rgb.device)
+        resized_normal = resized_normal.permute((2, 0, 1))
+    else:
+        resized_normal = None
+
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  image_path=cam_info.image_path, depth=resized_depth, normal=resized_normal)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

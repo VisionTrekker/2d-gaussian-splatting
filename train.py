@@ -79,14 +79,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 最小化 与光线相交的2D高斯与2D高斯之间的距离，将2D高斯局部约束在表面上
         rend_dist = render_pkg["rend_dist"]
+        dist_loss = lambda_dist * (rend_dist).mean()
+
         rend_normal  = render_pkg['rend_normal']
         surf_normal = render_pkg['surf_normal']
         normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
         normal_loss = lambda_normal * (normal_error).mean()
-        dist_loss = lambda_dist * (rend_dist).mean()
+
+        gt_normal = viewpoint_cam.normal.cuda()
+        gt_normal_error = (1 - (rend_normal * gt_normal).sum(dim=0))[None]
+        gt_normal_loss = lambda_normal * (gt_normal_error).mean()
 
         # loss
-        total_loss = loss + dist_loss + normal_loss
+        total_loss = loss + dist_loss + normal_loss + gt_normal_loss
         
         total_loss.backward()
 
