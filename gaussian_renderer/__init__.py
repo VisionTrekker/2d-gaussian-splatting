@@ -121,6 +121,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # get normal map
     # 渲染的法向量图，并将其从相机坐标系转换到世界坐标系中，transform normal from view space to world space
     render_normal = allmap[2:5] # 3 H W
+    render_normal_view = render_normal
     render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)    # H W 3 @ 3 3 = H W 3 ==> 3 H W
     
     # 渲染的中值深度图，get median depth map
@@ -149,7 +150,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rets.update({
             'rend_alpha': render_alpha,
-            'rend_normal': render_normal,
+            'rend_normal': render_normal,   # 转换到世界坐标系下的渲染法向量图
+            'rend_normal_view': render_normal_view,   # 当前相机坐标系下的渲染法向量图
             'rend_dist': render_dist,   # 与光线相交的2D高斯与2D高斯之间的距离
             'surf_depth': surf_depth,   # 伪表面深度图
             'surf_normal': surf_normal, # 由伪表面深度图计算法向量图，3 H W

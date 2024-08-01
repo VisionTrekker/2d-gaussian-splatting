@@ -82,7 +82,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dist_loss = lambda_dist * (rend_dist).mean()
 
 
-        rend_normal = render_pkg['rend_normal']    # 渲染的normal
+        rend_normal = render_pkg['rend_normal']    # 世界坐标系下的渲染normal
+        rend_normal_view = render_pkg['rend_normal_view']   # 当前相机坐标系下的渲染normal
         surf_normal = render_pkg['surf_normal']    # 从渲染深度图计算的normal
         gt_normal = viewpoint_cam.normal.cuda()
 
@@ -95,8 +96,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # normal_loss = lambda_normal * (normal_error).mean()
 
         # 计算渲染的normal与gt normal之间的Loss
-        gt_normal_error = (1 - (rend_normal * gt_normal).sum(dim=0))[None]
-        normal_loss = lambda_normal * (gt_normal_error).mean()
+        normal_error = (1 - (rend_normal_view * gt_normal).sum(dim=0))[None]
+        normal_loss = lambda_normal * (normal_error).mean()
 
         # loss
         total_loss = loss + dist_loss + normal_loss
