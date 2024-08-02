@@ -79,11 +79,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 最小化 与光线相交的2D高斯与2D高斯之间的距离，将2D高斯局部约束在表面上
         rend_dist = render_pkg["rend_dist"]
-        rend_normal  = render_pkg['rend_normal']
-        surf_normal = render_pkg['surf_normal']
+        dist_loss = lambda_dist * (rend_dist).mean()
+
+
+        rend_normal = render_pkg['rend_normal']    # 世界坐标系下的渲染normal
+        rend_normal_view = render_pkg['rend_normal_view']   # 相机坐标系下的渲染normal
+        surf_normal = render_pkg['surf_normal']             # 世界坐标系下从渲染深度图计算的normal
+        surf_normal_view = (surf_normal.permute(1, 2, 0) @ viewpoint_cam.world_view_transform[:3, :3]).permute(2, 0, 1)
+        gt_normal_view = viewpoint_cam.normal.cuda()
+        gt_normal = (gt_normal_view.permute(1, 2, 0) @ (viewpoint_cam.world_view_transform[:3, :3].T)).permute(2, 0, 1)
+
+        # 世界坐标系下 渲染的normal 与 从伪表面深度图计算的normal 的Loss
         normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
         normal_loss = lambda_normal * (normal_error).mean()
-        dist_loss = lambda_dist * (rend_dist).mean()
+
+        # gt normal 与 从伪表面深度图计算的normal 的Loss
+        # normal_error = (1 - (gt_normal_view * surf_normal_view).sum(dim=0))[None]
+        # normal_loss = lambda_normal * (normal_error).mean()
+
+        # gt normal 与 渲染的normal 的Loss
+        # normal_error = (1 - (gt_normal_view * rend_normal_view).sum(dim=0))[None]
+        # normal_loss += lambda_normal * (normal_error).mean()
 
         # loss
         total_loss = loss + dist_loss + normal_loss
