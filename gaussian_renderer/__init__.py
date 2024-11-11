@@ -115,11 +115,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     }
 
 
-    # additional regularizations
+    # 所有像素渲染完成后的 不透明度（1-透射率）
     render_alpha = allmap[1:2]
 
     # get normal map
-    # 渲染的法向量图，并将其从相机坐标系转换到世界坐标系中，transform normal from view space to world space
+    # 渲染的法向量图，并将其从相机坐标系转换到世界坐标系中（未归一化）
     render_normal = allmap[2:5] # 3 H W
     render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)    # H W 3 @ 3 3 = H W 3 ==> 3 H W
 
@@ -138,8 +138,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # 无边界场景(MipNeRF360)，depth_ratio = 0，使用 期望深度，减少伪影
     surf_depth = render_depth_expected * (1-pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median    # 1 H W
     
-    # 从伪表面深度图计算表面法向量 surf_normal：假设深度点分布于表面，使用它们生成伪表面法向量，用于正则化
-    surf_normal = depth_to_normal(viewpoint_camera, surf_depth) # H W 3
+    # 从 相机坐标系下的渲染深度图 计算 世界坐标系下的法向量
+    surf_normal = depth_to_normal(viewpoint_camera, surf_depth) # H W 3（从当前相机坐标系下的深度图生成世界坐标系下的点云，再假设深度点分布于表面计算法向量，已归一化）
     surf_normal = surf_normal.permute(2,0,1)
     # 记得乘以累加权重accum_alpha，因为render_normal未归一化
     surf_normal = surf_normal * (render_alpha).detach() # 3 H W
@@ -152,7 +152,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'rend_alpha': render_alpha,
             'rend_normal': render_normal,
             'rend_dist': render_dist,   # 与光线相交的2D高斯与2D高斯之间的距离
-            'surf_depth': surf_depth,   # 伪表面深度图，1 H W
+            'surf_depth': surf_depth,   # 当前相机坐标系下伪表面深度图，1 H W
             'surf_normal': surf_normal, # 由伪表面深度图计算的世界坐标下的表面法向量，3 H W
     })
 

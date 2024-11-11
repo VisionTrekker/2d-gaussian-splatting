@@ -68,8 +68,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        
+
         gt_image = viewpoint_cam.original_image.cuda()
+        # (1) image loss
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
@@ -77,7 +78,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
 
-        # 最小化 与光线相交的2D高斯与2D高斯之间的距离，将2D高斯局部约束在表面上
+        # (2) depth loss: 最小化 与光线相交的2D高斯与2D高斯之间的距离，将2D高斯局部约束在表面上
         rend_dist = render_pkg["rend_dist"]
         dist_loss = lambda_dist * (rend_dist).mean()
 

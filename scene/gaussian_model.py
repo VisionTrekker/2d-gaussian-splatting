@@ -123,6 +123,7 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
+        # 以稀疏点云的中心位置作为3D高斯的中心
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())   # (N, 3)
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # (N, 3, (最大球谐阶数 + 1)²)
@@ -132,8 +133,9 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        # dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)    # 初始化2D高斯在两个方向上的缩放因子为 该点与其K个最近邻点的平均距离 (N, 2)
-        # 初始化2D高斯的旋转四元数 为[0,1]的均匀分布，3DGS是无旋转的单位四元数 (N, 4)
+        # 默认的：初始化2D高斯的旋转四元数 为[0,1]的均匀分布，3DGS是无旋转的单位四元数 (N, 4)
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
         # 初始化各2D高斯的 不透明度为0.1 (N, 1)
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))

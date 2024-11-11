@@ -17,9 +17,9 @@ def depths_to_points(view, depthmap):
         [W / 2, 0, 0, (W) / 2],
         [0, H / 2, 0, (H) / 2],
         [0, 0, 0, 1]]).float().cuda().T
-    # C2NDC = C2W @ W2NDC，(4, 4)
+    # 投影变换 C2NDC = C2W @ W2NDC，(4, 4)
     projection_matrix = c2w.T @ view.full_proj_transform
-    # C2pix(内参矩阵) = C2NDC @ NDC2pix，(4, 4) @ (4, 3) => (4, 3) => (3, 3)
+    # 相机坐标系2图像坐标系的旋转矩阵，即 内参矩阵 = 投影变换C2NDC @ 视口变换NDC2pix，(4, 4) @ (4, 3) => (4, 3) => (3, 3)
     intrins = (projection_matrix @ ndc2pix)[:3,:3].T
 
     # 构建深度图的网格坐标
@@ -30,7 +30,8 @@ def depths_to_points(view, depthmap):
 
     # 每个像素点在世界坐标系中的坐标：pix @ pix2C @ C2W，(H*W, 3) @ (3, 3) @ (3, 3) = (H*W, 3)
     rays_d = points @ intrins.inverse().T @ c2w[:3,:3].T
-    rays_o = c2w[:3,3]  # 相机光心在世界坐标系中的位置(射线起点)，(3,)
+    # 相机光心在世界坐标系中的位置(射线起点)，(3,)
+    rays_o = c2w[:3,3]
 
     # 3D点云 在世界坐标系中的坐标，(H*W, 1) * (H*W, 3) = (H*W, 3)
     points = depthmap.reshape(-1, 1) * rays_d + rays_o
@@ -38,13 +39,14 @@ def depths_to_points(view, depthmap):
 
 def depth_to_normal(view, depth):
     """
-    从伪表面深度图计算表面法向量 surf_normal
+    从相机坐标系下的伪表面深度图 计算 世界坐标系下的表面法向量 surf_normal（已归一化）
         view: 当前相机
         depth: 当前相机坐标系下的 伪表面深度图，(1, H, W)
     """
-    # 从深度图生成世界坐标系下的3D点云
+    # 从伪表面深度图生成世界坐标系下的3D点云
     points = depths_to_points(view, depth).reshape(*depth.shape[1:], 3) # (H, W, 3)
 
+    # 假设深度点分布于表面，使用它们生成伪表面法向量
     output = torch.zeros_like(points)
     # 计算世界坐标系下3D点云在x、y方向上的梯度
     dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)   # (H-2, W-2, 3)

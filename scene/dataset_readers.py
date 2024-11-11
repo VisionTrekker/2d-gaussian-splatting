@@ -29,11 +29,12 @@ class CameraInfo(NamedTuple):
     T: np.array
     FovY: np.array
     FovX: np.array
-    image: np.array
     image_path: str
     image_name: str
     width: int
     height: int
+    depth_path: str
+    normal_path: str
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -65,7 +66,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, load_depth=False, load_normal=False, man_trans=None):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -79,8 +80,21 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         width = intr.width
 
         uid = intr.id
-        R = np.transpose(qvec2rotmat(extr.qvec))
-        T = np.array(extr.tvec)
+        if man_trans is None:
+            R = np.transpose(qvec2rotmat(extr.qvec))
+            T = np.array(extr.tvec)
+        else:
+            R = np.transpose(qvec2rotmat(extr.qvec))
+            T = np.array(extr.tvec)
+            W2C = np.zeros((4, 4))
+            W2C[:3, :3] = R.transpose()
+            W2C[:3, -1] = T
+            W2C[3, 3] = 1.0
+            W2nC = W2C @ np.linalg.inv(man_trans)  # 相机跟着点云旋转平移后得到新的相机坐标系nC
+
+            R = W2nC[:3, :3]
+            R = R.transpose()  # nC->世界的旋转矩阵
+            T = W2nC[:3, -1]  # 世界->nC的平移向量
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
@@ -94,20 +108,38 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_path = os.path.join(images_folder, extr.name)
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
+        if not os.path.exists(image_path):
+            continue
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+        depth_path = None
+        normal_path = None
+        if load_depth:
+            # depth_path = image_path.replace("images", "depth")[:-4] + ".png"
+            depth_path = image_path.replace("images", "depth")[:-4] + ".npy"
+        if load_normal:
+            normal_path = image_path.replace("images", "normal")[:-4] + ".npy"
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX,
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              depth_path=depth_path, normal_path=normal_path)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
 
-def fetchPly(path):
+def fetchPly(path, man_trans=None):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    # 因为加载的是调整后的点云，所以只需对相机位姿作变换，不需要对normal作变换
+    # if man_trans is not None:
+    #     man_trans_R = man_trans[:3, :3]
+    #     man_trans_T = man_trans[:3, -1]
+    #     new_positions = np.dot(man_trans_R, positions.transpose()) + np.repeat(man_trans_T, positions.shape[0]).reshape(
+    #         -1, positions.shape[0])
+    #     positions = new_positions.transpose()
+
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
@@ -129,7 +161,9 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8, load_depth=False, load_normal=False, man_trans=None):
+    print("Load depth: {}, Load normal: {}".format(load_depth, load_normal))
+    print("Use manhattan: ", man_trans)
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -142,7 +176,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir),
+                                           load_depth=load_depth, load_normal=load_normal, man_trans=man_trans)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
@@ -165,7 +200,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
     try:
-        pcd = fetchPly(ply_path)
+        pcd = fetchPly(ply_path, man_trans=man_trans)
     except:
         pcd = None
 

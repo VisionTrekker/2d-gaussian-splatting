@@ -92,8 +92,8 @@ class GaussianExtractor(object):
         self.depthmaps = []
         # self.alphamaps = []
         self.rgbmaps = []
-        # self.normals = []
-        # self.depth_normals = []
+        self.normals = []
+        self.depth_normals = []
         self.viewpoint_stack = []
 
     @torch.no_grad()
@@ -113,8 +113,8 @@ class GaussianExtractor(object):
             self.rgbmaps.append(rgb.cpu())
             self.depthmaps.append(depth.cpu())
             # self.alphamaps.append(alpha.cpu())
-            # self.normals.append(normal.cpu())
-            # self.depth_normals.append(depth_normal.cpu())
+            self.normals.append(normal.cpu())
+            self.depth_normals.append(depth_normal.cpu())
         
         # self.rgbmaps = torch.stack(self.rgbmaps, dim=0)
         # self.depthmaps = torch.stack(self.depthmaps, dim=0)
@@ -279,17 +279,29 @@ class GaussianExtractor(object):
         return mesh
 
     @torch.no_grad()
-    def export_image(self, path):
+    def export_image(self, path):   # ../output/gm_Museum_0.05normal_gt_surfel/train/ours_30000
         render_path = os.path.join(path, "renders")
         gts_path = os.path.join(path, "gt")
         vis_path = os.path.join(path, "vis")
+        normal_path = os.path.join(path, "normal")
+        depth_normal_path = os.path.join(path, "depth_normal")
         os.makedirs(render_path, exist_ok=True)
-        os.makedirs(vis_path, exist_ok=True)
         os.makedirs(gts_path, exist_ok=True)
+        os.makedirs(vis_path, exist_ok=True)
+        os.makedirs(normal_path, exist_ok=True)
+        os.makedirs(depth_normal_path, exist_ok=True)
         for idx, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="export images"):
+            view_subfolder = viewpoint_cam.image_path.split("/")[-2]    # /data2/liuzhi/Dataset/3DGS_Dataset/input/gm_Museum/images/00/0000.png
+            os.makedirs(os.path.join(render_path, view_subfolder), exist_ok=True)
+            os.makedirs(os.path.join(gts_path, view_subfolder), exist_ok=True)
+            os.makedirs(os.path.join(vis_path, view_subfolder), exist_ok=True)
+            os.makedirs(os.path.join(normal_path, view_subfolder), exist_ok=True)
+            os.makedirs(os.path.join(depth_normal_path, view_subfolder), exist_ok=True)
+            view_name = viewpoint_cam.image_name
+
             gt = viewpoint_cam.original_image[0:3, :, :]
-            save_img_u8(gt.permute(1,2,0).cpu().numpy(), os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-            save_img_u8(self.rgbmaps[idx].permute(1,2,0).cpu().numpy(), os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+            save_img_u8(gt.permute(1,2,0).cpu().numpy(), os.path.join(gts_path, view_subfolder, '{}'.format(view_name) + ".png"))
+            save_img_u8(self.rgbmaps[idx].permute(1,2,0).cpu().numpy(), os.path.join(render_path, view_subfolder, '{}'.format(view_name) + ".png"))
             save_img_f32(self.depthmaps[idx][0].cpu().numpy(), os.path.join(vis_path, 'depth_{0:05d}'.format(idx) + ".tiff"))
-            # save_img_u8(self.normals[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5, os.path.join(vis_path, 'normal_{0:05d}'.format(idx) + ".png"))
-            # save_img_u8(self.depth_normals[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5, os.path.join(vis_path, 'depth_normal_{0:05d}'.format(idx) + ".png"))
+            save_img_u8(self.normals[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5, os.path.join(normal_path, view_subfolder, '{}'.format(view_name) + ".png"))
+            save_img_u8(self.depth_normals[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5, os.path.join(depth_normal_path, view_subfolder, '{}'.format(view_name) + ".png"))
