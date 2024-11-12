@@ -66,7 +66,7 @@ class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
-        self.depth_ratio = 0.0  # 有界场景(TnT、DTU)为1，伪表面深度使用中值深度；无边界场景(MipNeRF360)为0，使用期望深度，减少伪影
+        self.depth_ratio = 0.0
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
 
@@ -83,7 +83,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_dist = 0.0  # MipNeRF360为0；TnT环绕场景为100，大场景为10；DTU为1000
+        self.lambda_dist = 100.0    # DTU数据集为1000，MipNeRF360为默认的100，TNT根据场景设置为100或10
         self.lambda_normal = 0.05
         self.opacity_cull = 0.05
 
@@ -93,6 +93,41 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         super().__init__(parser, "Optimization Parameters")
+
+
+class TrimGSOptimizationParams(ParamGroup):
+    def __init__(self, parser):
+        self.iterations = 30_000
+        self.position_lr_init = 0.00016
+        self.position_lr_final = 0.0000016
+        self.position_lr_delay_mult = 0.01
+        self.position_lr_max_steps = 30_000
+        self.feature_lr = 0.0025
+        self.opacity_lr = 0.05
+        self.scaling_lr = 0.005
+        self.rotation_lr = 0.001
+        self.percent_dense = 0.01
+        self.lambda_dssim = 0.2
+        self.lambda_dist = 100.0
+        self.lambda_normal = 0.05
+        self.opacity_cull = 0.05
+        self.max_screen_size = 20
+
+        self.depth_grad_thresh = 0.03
+        self.depth_grad_mask_dilation = 1
+
+        self.densification_interval = 100
+        self.opacity_reset_interval = 3000
+        self.densify_from_iter = 500
+        self.densify_until_iter = 15_000
+        self.densify_grad_threshold = 0.0002
+        self.densify_scale_factor = 0.3     # 分裂中 轴长阈值的调节因子
+
+        self.contribution_prune_from_iter = 500
+        self.contribution_prune_interval = 300
+        self.contribution_prune_ratio = 0.1
+        super().__init__(parser, "Optimization Parameters")
+
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]

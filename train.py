@@ -11,6 +11,7 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -21,16 +22,96 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import ModelParams, PipelineParams, TrimGSOptimizationParams
+import logging
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+# try:
+#     import debugpy
+#     debugpy.listen(5678)
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except:
+#     pass
+
+def culling(xyz, cams, expansion=2):
+    # 获取所有训练相机中心世界坐标
+    cam_centers = torch.stack([c.camera_center for c in cams], 0).to(xyz.device)    # (N,3)
+    span_x = cam_centers[:, 0].max() - cam_centers[:, 0].min()
+    span_y = cam_centers[:, 1].max() - cam_centers[:, 1].min() # smallest span
+    span_z = cam_centers[:, 2].max() - cam_centers[:, 2].min()
+
+    scene_center = cam_centers.mean(0)  # (3,)
+
+    span_x = span_x * expansion
+    span_y = span_y * expansion
+    span_z = span_z * expansion
+
+    x_min = scene_center[0] - span_x / 2
+    x_max = scene_center[0] + span_x / 2
+
+    y_min = scene_center[1] - span_y / 2
+    y_max = scene_center[1] + span_y / 2
+
+    z_min = scene_center[2] - span_x / 2
+    z_max = scene_center[2] + span_x / 2
+
+    # 取出方形大包围盒（2倍原相机包围盒长度）内的高斯
+    valid_mask = (xyz[:, 0] > x_min) & (xyz[:, 0] < x_max) & \
+                 (xyz[:, 1] > y_min) & (xyz[:, 1] < y_max) & \
+                 (xyz[:, 2] > z_min) & (xyz[:, 2] < z_max)
+    # print(f'scene mask ratio {valid_mask.sum().item() / valid_mask.shape[0]}')
+
+    return valid_mask, scene_center
+
+def prune_low_contribution_gaussians(gaussians, cameras, pipe, bg, K=5, prune_ratio=0.1):
+    """
+    剪枝掉低贡献度的高斯
+        gaussians   高斯模型
+        cameras     所有训练相机
+        pipe        渲染管线参数
+        bg      背景颜色，默认为黑色
+        K
+        prune_ratio 贡献度的剪枝率0.1
+    """
+    top_list = [None, ] * K
+    for i, cam in enumerate(cameras):
+        # 遍历每个训练相机，渲染（只计算透明率，即高斯对多视角的贡献度）
+        trans = render(cam, gaussians, pipe, bg, record_transmittance=True)
+        if top_list[0] is not None:
+            m = trans > top_list[0]
+            if m.any():
+                for i in range(K - 1):
+                    top_list[K - 1 - i][m] = top_list[K - 2 - i][m]
+                top_list[0][m] = trans[m]
+        else:
+            # 初值为贡献度高的 前5个视角
+            top_list = [trans.clone() for _ in range(K)]
+
+    contribution = torch.stack(top_list, dim=-1).mean(-1)
+    tile = torch.quantile(contribution, prune_ratio)
+    prune_mask = contribution < tile
+    gaussians.prune_points(prune_mask)
+    torch.cuda.empty_cache()
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, split):
+    """
+        split: 分裂策略，默认 mix
+    """
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+
+    model_params = "\n".join([f'{k}: {v}' for k, v in vars(dataset).items()])
+    logging.info(f"Model params:\n{model_params}")
+    fine_tune_params = "\n".join([f'{k}: {v}' for k, v in vars(opt).items()])
+    logging.info(f"Finetune Params:\n{fine_tune_params}")
+    pipe_params = "\n".join([f'{k}: {v}' for k, v in vars(pipe).items()])
+    logging.info(f"Pipeline params:\n{pipe_params}")
+
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -51,7 +132,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    all_cameras = scene.getTrainCameras().copy()
+    for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
 
@@ -65,7 +147,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-        
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -73,7 +155,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # (1) image loss
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        
+
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
@@ -87,24 +169,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         rend_normal_view = render_pkg['rend_normal_view']   # 相机坐标系下的渲染normal
         surf_normal = render_pkg['surf_normal']             # 世界坐标系下从渲染深度图计算的normal
         surf_normal_view = (surf_normal.permute(1, 2, 0) @ viewpoint_cam.world_view_transform[:3, :3]).permute(2, 0, 1)
-        gt_normal_view = viewpoint_cam.normal.cuda()
-        gt_normal = (gt_normal_view.permute(1, 2, 0) @ (viewpoint_cam.world_view_transform[:3, :3].T)).permute(2, 0, 1)
 
-        # 世界坐标系下 渲染的normal 与 从伪表面深度图计算的normal 的Loss
-        normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+        depth_map = render_pkg["surf_depth"][0]  # 相机坐标系下的渲染depth。(1,H,W)
+        if opt.depth_grad_thresh > 0:
+            # 设定了深度梯度阈值
+            depth_map_for_grad = depth_map[None, None]  # (1,1,H,W)
+            sobel_kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=depth_map.dtype,
+                                          device=depth_map.device).view(1, 1, 3, 3)
+            sobel_kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=depth_map.dtype,
+                                          device=depth_map.device).view(1, 1, 3, 3)
+
+            depth_map_for_grad = F.pad(depth_map_for_grad, pad=(1, 1, 1, 1), mode="replicate")
+            # 计算渲染深度图的梯度
+            depth_grad_x = F.conv2d(depth_map_for_grad, sobel_kernel_x) / 3
+            depth_grad_y = F.conv2d(depth_map_for_grad, sobel_kernel_y) / 3
+            depth_grad_mag = torch.sqrt(depth_grad_x ** 2 + depth_grad_y ** 2)
+
+            depth_grad_weight = (depth_grad_mag < opt.depth_grad_thresh).float()  # < 0.03
+            if opt.depth_grad_mask_dilation > 0:
+                mask_di = opt.depth_grad_mask_dilation  # 1
+                depth_grad_weight = -1 * F.max_pool2d(-1 * depth_grad_weight, mask_di * 2 + 1, stride=1,
+                                                      padding=mask_di)
+            depth_grad_weight = depth_grad_weight.squeeze().detach()
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0)) * depth_grad_weight
+            normal_error = normal_error[None]
+        else:
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+
         normal_loss = lambda_normal * (normal_error).mean()
-
-        # gt normal 与 从伪表面深度图计算的normal 的Loss
-        # normal_error = (1 - (gt_normal_view * surf_normal_view).sum(dim=0))[None]
-        # normal_loss = lambda_normal * (normal_error).mean()
-
-        # gt normal 与 渲染的normal 的Loss
-        # normal_error = (1 - (gt_normal_view * rend_normal_view).sum(dim=0))[None]
-        # normal_loss += lambda_normal * (normal_error).mean()
 
         # loss
         total_loss = loss + dist_loss + normal_loss
-        
+
         total_loss.backward()
 
         iter_end.record()
@@ -121,7 +217,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
-                    "Points": f"{len(gaussians.get_xyz)}"
+                    "Points": f"{gaussians.get_xyz.shape[0]}"
                 }
                 progress_bar.set_postfix(loss_dict)
 
@@ -138,6 +234,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                logging.info(f"[ITER {iteration}] reg_loss: {Ll1.item()} total_loss: {loss.item()} total_points: {scene.gaussians.get_xyz.shape[0]}")
 
 
             # Densification
@@ -146,9 +243,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
-                
+                    if split == "ordinary":
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, max_screen_size=opt.max_screen_size)
+
+                    elif split == "scale":
+                        # 所有高斯在两倍相机包围盒内的mask，(N,) 与 训练相机中点
+                        scene_mask, scene_center = culling(gaussians.get_xyz, scene.getTrainCameras())
+                        gaussians.densify_and_scale_split(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, opt.max_screen_size, opt.densify_scale_factor, scene_mask, N=3, no_grad=True)
+
+                    elif split == "mix":
+                        grads = gaussians.xyz_gradient_accum / gaussians.denom
+                        grads[grads.isnan()] = 0.0
+                        # 先增稠
+                        gaussians.densify_and_clone(grads, opt.densify_grad_threshold, scene.cameras_extent)
+                        gaussians.densify_and_split(grads, opt.densify_grad_threshold, scene.cameras_extent)
+                        # 计算高斯分布在所有训练相机bbox内的mask
+                        scene_mask, scene_center = culling(gaussians.get_xyz, scene.getTrainCameras())
+                        # 基于尺度的分裂策略
+                        gaussians.densify_and_scale_split(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, opt.max_screen_size, opt.densify_scale_factor, scene_mask, N=3, no_grad=True)
+
+                    elif split == "none":
+                        pass
+                    else:
+                        raise ValueError(f"Unknown split type {split}")
+
+                if iteration > opt.contribution_prune_from_iter and iteration % opt.contribution_prune_interval == 0:
+                    # 1000 - 15000代开始每500代修剪一次，去除贡献度最低10%的高斯
+                    prune_low_contribution_gaussians(gaussians, all_cameras, pipe, background, K=5, prune_ratio=opt.contribution_prune_ratio)
+                    print(f'Num gs after contribution prune: {len(gaussians.get_xyz)}')
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -161,44 +284,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        with torch.no_grad():        
-            if network_gui.conn == None:
-                network_gui.try_connect(dataset.render_items)
-            while network_gui.conn != None:
-                try:
-                    net_image_bytes = None
-                    custom_cam, do_training, keep_alive, scaling_modifer, render_mode = network_gui.receive()
-                    if custom_cam != None:
-                        render_pkg = render(custom_cam, gaussians, pipe, background, scaling_modifer)   
-                        net_image = render_net_image(render_pkg, dataset.render_items, render_mode, custom_cam)
-                        net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                    metrics_dict = {
-                        "#": gaussians.get_opacity.shape[0],
-                        "loss": ema_loss_for_log
-                        # Add more metrics as needed
-                    }
-                    # Send the data
-                    network_gui.send(net_image_bytes, dataset.source_path, metrics_dict)
-                    if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                        break
-                except Exception as e:
-                    # raise e
-                    network_gui.conn = None
-
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
-
+    # 创建log保存文件
+    logging.basicConfig(filename=os.path.join(args.model_path, "training.log"), level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
@@ -218,7 +318,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
@@ -271,7 +371,7 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
-    op = OptimizationParams(parser)
+    op = TrimGSOptimizationParams(parser)
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
@@ -281,18 +381,19 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--split", type=str, default = "mix")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.split)
 
     # All done
     print("\nTraining complete.")
