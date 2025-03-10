@@ -136,6 +136,7 @@ def read_points3D_binary(path_to_model_file):
         xyzs = np.empty((num_points, 3))
         rgbs = np.empty((num_points, 3))
         errors = np.empty((num_points, 1))
+        tracks = np.zeros((num_points, 1), dtype=np.uint8)
 
         for p_id in range(num_points):
             binary_point_line_properties = read_next_bytes(
@@ -151,7 +152,9 @@ def read_points3D_binary(path_to_model_file):
             xyzs[p_id] = xyz
             rgbs[p_id] = rgb
             errors[p_id] = error
-    return xyzs, rgbs, errors
+            tracks[p_id] = track_length
+
+    return xyzs, rgbs, errors, tracks
 
 def read_intrinsics_text(path):
     """

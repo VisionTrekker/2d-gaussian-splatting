@@ -142,18 +142,20 @@ def fetchPly(path, man_trans=None):
 
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
-    return BasicPointCloud(points=positions, colors=colors, normals=normals)
+    tracks = np.vstack(vertices['track']) if 'track' in vertices else np.zeros((positions.shape[0], 1))
+    return BasicPointCloud(points=positions, colors=colors, normals=normals, tracks=tracks)
 
-def storePly(path, xyz, rgb):
+def storePly(path, xyz, rgb, tracks):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
-            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
+            ('track', 'u1')]
     
     normals = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
-    attributes = np.concatenate((xyz, normals, rgb), axis=1)
+    attributes = np.concatenate((xyz, normals, rgb, tracks), axis=1)
     elements[:] = list(map(tuple, attributes))
 
     # Create the PlyData object and write to file
@@ -195,10 +197,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, load_depth=False, load_n
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            xyz, rgb, _, tracks = read_points3D_binary(bin_path)
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
+        storePly(ply_path, xyz, rgb, tracks)
     try:
         pcd = fetchPly(ply_path, man_trans=man_trans)
     except:

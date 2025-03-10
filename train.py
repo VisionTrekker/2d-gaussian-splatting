@@ -8,7 +8,8 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import math
+import numpy as np
 import os
 import torch
 from random import randint
@@ -22,6 +23,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.loss_utils import depth_EdgeAwareLogL1, depth_smooth_loss, depth_align, save_depth_comparsion
+from torchmetrics.functional.regression import pearson_corrcoef
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -80,26 +84,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # (2) depth loss: 最小化 与光线相交的2D高斯与2D高斯之间的距离，将2D高斯局部约束在表面上
         rend_dist = render_pkg["rend_dist"]
-        dist_loss = lambda_dist * (rend_dist).mean()
+        rend_depth = render_pkg["surf_depth"]   # 相机坐标系下的渲染depth。1 H W
+        if not dataset.load_depth:
+            # print("use self depth regularization")
+            dist_loss = lambda_dist * (rend_dist).mean()
+        else:
+            # print("use gt depth regularization")
+            gt_depth = viewpoint_cam.depth.cuda()   # 1 H W
+            rend_depth_aligned, scale_factor = depth_align(gt_depth, rend_depth)
+            # print(f"Estimated scale factor: {scale_factor:.4f}")
+            # print(f"GT depth range: {gt_depth.min():.4f}, {gt_depth.max():.4f}, size: {gt_depth.size()}")
+            # print(f"Rend depth range: {rend_depth.min():.4f}, {rend_depth.max():.4f}")
+            # print(f"Aligned rend depth range: {rend_depth_aligned.min():.4f}, {rend_depth_aligned.max():.4f}, size: {rend_depth_aligned.size()}")
 
+            # if iteration % 300 == 0:
+            #     save_depth_comparsion(gt_depth, rend_depth, rend_depth_aligned,
+            #                           save_path="/data2/liuzhi/3DGS_code/2d-gaussian-splatting/output/7copybook_densify_noplanar_nofixnormal_0.05gtnormal_gtsurfel_0.1gtdepth/depth_align" + str(iteration) + ".png")
 
+            filter_mask_depth = torch.logical_and(gt_depth>1e-3, gt_depth>1e-3)
+            l_depth = depth_EdgeAwareLogL1(rend_depth_aligned, gt_depth, gt_image, filter_mask_depth)
+            dist_loss = lambda_dist * l_depth
+
+            # l_depth_smooth = depth_smooth_loss(rend_depth_aligned, filter_mask_depth)
+            # dist_loss = lambda_dist * (l_depth + 0.5 * l_depth_smooth)
+            # print(f"l_depth: {l_depth:.{4}f}, l_depth_smooth: {l_depth_smooth:.{4}f}, dist_loss: {dist_loss:.{4}f}")
+
+            # 皮尔逊损失
+            # rend_depth = rend_depth[0].reshape(-1, 1)
+            # gt_depth = gt_depth[0].reshape(-1, 1)
+            #
+            # valid_gt_index = gt_depth > 0
+            # valid_gt_data = gt_depth[valid_gt_index]
+            # valid_gt_depth_th = np.percentile(valid_gt_data.cpu().numpy(), 10)
+            #
+            # valid_index = gt_depth < valid_gt_depth_th
+            # gt_depth[valid_index] = 0.0
+            # rend_depth[valid_index] = 0.0
+            # depth_error = min((1 - pearson_corrcoef(-gt_depth, rend_depth)),
+            #                 (1 - pearson_corrcoef(1 / (gt_depth + 200), rend_depth)))
+            # dist_loss = lambda_dist * depth_error
+
+        # (3) normal loss
         rend_normal = render_pkg['rend_normal']    # 世界坐标系下的渲染normal
         rend_normal_view = render_pkg['rend_normal_view']   # 相机坐标系下的渲染normal
         surf_normal = render_pkg['surf_normal']             # 世界坐标系下从渲染深度图计算的normal
         surf_normal_view = (surf_normal.permute(1, 2, 0) @ viewpoint_cam.world_view_transform[:3, :3]).permute(2, 0, 1)
-        gt_normal_view = viewpoint_cam.normal.cuda()
-        gt_normal = (gt_normal_view.permute(1, 2, 0) @ (viewpoint_cam.world_view_transform[:3, :3].T)).permute(2, 0, 1)
 
-        # 世界坐标系下 渲染的normal 与 从伪表面深度图计算的normal 的Loss
-        normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
-        normal_loss = lambda_normal * (normal_error).mean()
+        if not dataset.load_normal:
+            # print("use self normal regularization")
+            # 世界坐标系下 渲染的normal 与 从伪表面深度图计算的normal 的Loss
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+            normal_loss = lambda_normal * (normal_error).mean()
+        else:
+            # print("use gt normal regularization")
+            gt_normal_view = viewpoint_cam.normal.cuda()
+            gt_normal = (gt_normal_view.permute(1, 2, 0) @ (viewpoint_cam.world_view_transform[:3, :3].T)).permute(2, 0, 1)
 
-        # gt normal 与 从伪表面深度图计算的normal 的Loss
-        # normal_error = (1 - (gt_normal_view * surf_normal_view).sum(dim=0))[None]
+            # gt normal 与 渲染的normal 的Loss
+            normal_error = (1 - (gt_normal * rend_normal).sum(dim=0))[None]
+            # GaussianPro中还计算了l1_normal：torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
+            normal_loss = lambda_normal * (normal_error).mean()
+
+            # gt normal 与 从伪表面深度图计算的normal 的Loss
+            normal_error = (1 - (gt_normal * surf_normal).sum(dim=0))[None]
+            normal_loss += lambda_normal * (normal_error).mean()
+
+        # gt_normal = viewpoint_cam.normal.cuda() # 从深度图计算的法向量是世界坐标系下的
+        # # gt normal 与 渲染的normal 的Loss
+        # normal_error = (1 - (gt_normal * rend_normal).sum(dim=0))[None]
+        # # GaussianPro中还计算了l1_normal：torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
         # normal_loss = lambda_normal * (normal_error).mean()
-
-        # gt normal 与 渲染的normal 的Loss
-        # normal_error = (1 - (gt_normal_view * rend_normal_view).sum(dim=0))[None]
+        # # gt normal 与 从伪表面深度图计算的normal 的Loss
+        # normal_error = (1 - (gt_normal * surf_normal).sum(dim=0))[None]
         # normal_loss += lambda_normal * (normal_error).mean()
 
         # loss
@@ -115,13 +171,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
 
+            # 法向量约束
+            # 方法1：将ratation的梯度置为0，真正起作用，rotation的值不变，且增稠的新高斯也有相同的ratation
+            # gaussians._rotation.grad = None
+            # gaussians._rotation.data.copy_(gaussians.initial_rotation)    # 值设为初始值（未验证）
+            # 方法2：创建self._rotation时将requires_grad设为True/False，
+            #       使用get_rotation.requires_grad查询的结果一直为False，使用_rotation.requires_grad查询的结果一直为True，但实际不起作用，ratation仍在计算梯度，其值一直在改变
+            # 方法3：在优化器中删除_rotation，在不增稠时实际起作用，但是开启增稠因查询不到_ratation的动量而报错
 
             if iteration % 10 == 0:
+                # 平面约束：将高斯强制拉到平面上
+                # gaussians.force_points_to_plane()
+
+                # 检查旋转的一致性
+                # max_diff = torch.max(torch.sum((gaussians.get_rotation - gaussians.get_rotation[0]) ** 2, dim=1))
+
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
-                    "Points": f"{len(gaussians.get_xyz)}"
+                    "Points": f"{len(gaussians.get_xyz)}",
+                    # "rots[-1]": [f"{x:.{4}f}" for x in gaussians.get_rotation[-1].tolist()],
+                    # "Max_rotation_diff": f"{max_diff.item()}"
                 }
                 progress_bar.set_postfix(loss_dict)
 

@@ -20,6 +20,21 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+import math
+from scipy.spatial.transform import Rotation
+
+from sklearn.linear_model import RANSACRegressor
+from sklearn.cluster import DBSCAN
+import open3d as o3d
+from scipy.spatial import ConvexHull
+
+
+def project_points_to_plane(points, plane_normal, plane_point):
+    # 计算点到平面的投影
+    plane_normal = plane_normal / np.linalg.norm(plane_normal)
+    points_from_plane = points - plane_point
+    projected_points = points - np.dot(points_from_plane, plane_normal[:, None]) * plane_normal
+    return projected_points
 
 class GaussianModel:
 
@@ -57,6 +72,13 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+
+        # 边界框
+        self.bbox_min = None
+        self.bbox_max = None
+        self._plane_normal = None
+        self._plane_d = None
+        self.initial_rotation = None
 
     def capture(self):
         return (
@@ -125,7 +147,41 @@ class GaussianModel:
         self.spatial_lr_scale = spatial_lr_scale
         # 以稀疏点云的中心位置作为3D高斯的中心
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())   # (N, 3)
+
+        # # 计算点云边界框并拟合平面方程
+        # # 计算边界框
+        # self.bbox_min = fused_point_cloud.min(dim=0).values
+        # self.bbox_max = fused_point_cloud.max(dim=0).values
+        # print("bbox_min: {}, {}, {}".format(self.bbox_min[0], self.bbox_min[1], self.bbox_min[2]))
+        # print("bbox_max: {}, {}, {}".format(self.bbox_max[0], self.bbox_max[1], self.bbox_max[2]))
+        # # 拟合平面方程 ax + by + cz + d = 0 (a,b,c对应法向量)
+        # # 方法1：协方差矩阵 拟合平面
+        # plane_normal, plane_d = self.fit_plane_by_cov(fused_point_cloud)
+        # # 方法2：协方差矩阵 拟合多个平面，选出最优的（未验证）
+        # # plane_normal, plane_d = self.fit_plane_by_cov_best(fused_point_cloud)
+        # # 方法3：RANSAC 拟合平面（未验证）
+        # # plane_normal, plane_d = self.fit_plane_by_ransac(fused_point_cloud.cpu().numpy())
+        # # 添加参数：平面方程的法向量和常数项（不可训练）
+        # self._plane_normal = nn.Parameter(plane_normal.requires_grad_(False))
+        # self._plane_d = nn.Parameter(plane_d.requires_grad_(False))
+        #
+        # # 将fused_point_cloud投影到平面上
+        # distance_to_plane = (torch.sum(fused_point_cloud * plane_normal, dim=1) + plane_d) / torch.norm(plane_normal)
+        # fused_point_cloud = fused_point_cloud - distance_to_plane.unsqueeze(1) * plane_normal / torch.norm(plane_normal)
+        # fused_point_cloud = torch.clamp(fused_point_cloud, min=self.bbox_min, max=self.bbox_max)
+        # # 点云稀疏采样
+        # downsampled_indices = self.downsample_points(fused_point_cloud.cpu().numpy(), num_points=6)
+        # fused_point_cloud = fused_point_cloud[downsampled_indices].cuda()
+        #
+        # # 将平面normal转换成四元数，设置给高斯
+        # plane_quat = self.quaternion_from_normal_by_axis(plane_normal)
+        # rots = plane_quat.repeat(fused_point_cloud.shape[0], 1)
+        # # self.initial_rotation = rots.clone().detach()
+        # print("rots[0]: {}".format(rots[0]))
+
+        origin_colors = torch.tensor(np.asarray(pcd.colors)).float().cuda()
+        # downsampled_colors = origin_colors[downsampled_indices]
+        fused_color = RGB2SH(origin_colors)   # (N, 3)
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # (N, 3, (最大球谐阶数 + 1)²)
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
@@ -148,6 +204,91 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))    # 0,1均匀分布的旋转四元数，(N, 4)
         self._opacity = nn.Parameter(opacities.requires_grad_(True))    # 不透明度，(N, 1)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")  # 投影到所有2D图像平面上的最大半径，初始化为0，(N, )
+
+    def fit_plane_by_cov(self, points):
+        centroid = torch.mean(points, dim=0)     # 计算点云的质心
+        centered_points = points - centroid      # 将点云中心化
+        cov = torch.mm(centered_points.t(), centered_points)# 计算协方差矩阵
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)  # 对协方差矩阵进行特征值分解
+        normal = eigenvectors[:, 0]                   # 最小特征值对应的特征向量就是平面法向量
+        d = -torch.dot(normal, centroid)        # 计算平面方程的d值
+        return normal / torch.norm(normal), d
+
+    def fit_plane_by_cov_best(self, points, num_planes=3):
+        best_normal = None
+        best_d = None
+        min_error = float("inf")
+
+        for _ in range(num_planes):
+            normal, d = self.fit_plane_by_cov(points)
+            error = torch.abs(torch.sum(points * normal, dim=1) + d).mean()
+            if error < min_error:
+                min_error = error
+                best_normal = normal
+                best_d = d
+        return best_normal, best_d
+
+    def fit_plane_by_ransac(self, points):
+        from sklearn.linear_model import RANSACRegressor
+        # 使用RANSAC拟合平面
+        ransac = RANSACRegressor(residual_threshold=0.01)
+        ransac.fit(points[:, :2], points[:, :2])
+        # 获取平面参数
+        a, b = ransac.estimator_.coef_
+        c = -1
+        d = ransac.estimator_.intercept_
+
+        normal = torch.tensor([a, b, c]).float().cuda()
+        normal = normal / torch.norm(normal)
+        return normal, torch.sensor(d).float().cuda()
+
+    def quaternion_from_normal_by_Rotation(self, normal):
+        r = Rotation.from_rotvec(math.pi / 2 * normal / np.linalg.norm(normal)) # 将法向量为轴，旋转90°，因此计算的旋转四元数 不对，从平行于y轴到平行于x轴
+        fix_rotation = torch.from_numpy(r.as_quat()[[3, 0, 1, 2]]).float().cuda()   # 四元数格式调整为 (qw, qx, qy, qz)
+        return fix_rotation
+
+    def quaternion_from_normal_by_axis(self, normal):
+        z_axis = torch.tensor([0.0, 0.0, 1.0]).float().cuda()
+        rotation_axis = torch.cross(z_axis, normal)     # 计算旋转轴
+        if torch.allclose(rotation_axis, torch.zeros(3, device=normal.device)):
+            rotation_axis = torch.tensor([1.0, 0.0, 0.0]).float().cuda()  # 选择任意正交轴
+        rotation_axis = rotation_axis / torch.norm(rotation_axis)
+
+        # 计算旋转角度
+        angle = torch.acos(torch.dot(normal, z_axis))
+        # qw, qx, qy, qz
+        quat = torch.tensor([
+            torch.cos(angle / 2),
+            torch.sin(angle / 2) * rotation_axis[0],
+            torch.sin(angle / 2) * rotation_axis[1],
+            torch.sin(angle / 2) * rotation_axis[2]
+        ], device=normal.device)
+        return quat / torch.norm(quat)
+
+    def downsample_points(self, points, num_points):
+        from sklearn.cluster import KMeans
+        # 均匀下采样点云
+        if len(points) <= num_points:
+            return np.arange(len(points))
+        # 使用K-means聚类来获取均匀分布的点
+        kmeans = KMeans(n_clusters=num_points, random_state=0)
+        kmeans.fit(points)
+
+        # 对于每个聚类，选择最接近中心的点
+        closest_indices = []
+        for center in kmeans.cluster_centers_:
+            distances = np.linalg.norm(points - center, axis=1)
+            closest_index = np.argmin(distances)
+            closest_indices.append(closest_index)
+
+        return np.array(closest_indices)
+
+    def force_points_to_plane(self):
+        # 允许平面参数微调时开启
+        # self._plane_normal.data = self._plane_normal.data / torch.norm(self._plane_normal.data)
+        distance_to_plane = (torch.sum(self._xyz * self._plane_normal, dim=1) + self._plane_d) / torch.norm(self._plane_normal)
+        self._xyz.data = self._xyz - distance_to_plane.unsqueeze(1) * self._plane_normal / torch.norm(self._plane_normal)
+        self._xyz.data = torch.clamp(self._xyz.data, min=self.bbox_min, max=self.bbox_max)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -191,24 +332,245 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def fit_plane(self, points):
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+
+        # 使用统计滤波去除离群点
+        cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        pcd = pcd.select_by_index(ind)
+
+        # 使用RANSAC算法拟合平面
+        planes = []
+        remaining_cloud = pcd
+
+        inliers_counts = []
+        areas = []
+        best_area = -10
+        best_inliers_counts = -1
+        best_id = -1
+        idx = 0
+
+        # 迭代10次，拟合最多10个平面
+        for _ in range(10):
+            if len(remaining_cloud.points) < 10:
+                break
+            # 拟合一个平面,并得到平面模型参数 plane_model 和内点索引 inliers
+            plane_model, inliers = remaining_cloud.segment_plane(distance_threshold=0.02, ransac_n=3,
+                                                                 num_iterations=1000)
+            # 计算平面的面积
+            # 提取内点
+            inlier_cloud = remaining_cloud.select_by_index(inliers)
+            inlier_points = np.asarray(inlier_cloud.points)
+            area = 0
+            if inlier_points.shape[0] > 3:
+                plane_normal = plane_model[:3]  # 平面法向量
+                plane_point = np.mean(inlier_points, axis=0)    # 平面中心点
+                projected_points = project_points_to_plane(inlier_points, plane_normal, plane_point)    # 内点投影到拟合的平面上
+                hull = ConvexHull(projected_points[:, :2])  # 投影到拟合平面后的xy平面
+                area = hull.volume  # 凸包的面积
+            if np.sum(inliers) > best_inliers_counts and area > best_area:
+                best_id = idx
+                best_inliers_counts = np.sum(inliers)
+                best_area = area
+            idx += 1
+            planes.append((plane_model, inliers, area))
+            remaining_cloud = remaining_cloud.select_by_index(inliers, invert=True)  # 移除当前平面的内点，在下一轮在剩余内点中拟合平面
+
+        best_plane = planes[best_id][0]
+        return best_plane
+
+    def save_centerObj_ply(self, path, bbox=None):
+        def filter_largest_cluster_dbscan_o3d(points, eps=0.13, min_samples=20):  # eps=0.2 min_samples=20
+            # Convert points to Open3D PointCloud
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+
+            # Apply DBSCAN clustering
+            labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_samples))
+
+            # Find the largest cluster
+            unique_labels, counts = np.unique(labels, return_counts=True)
+            largest_cluster_label = unique_labels[np.argmax(counts)]
+
+            # Filter points belonging to the largest cluster
+            inlier_mask = labels == largest_cluster_label
+            filtered_points = np.asarray(pcd.points)[inlier_mask]
+
+            return filtered_points, inlier_mask
+
+        def compute_pca(cloud):
+            from sklearn.decomposition import PCA
+
+            # 计算点云的质心
+            # centroid = np.mean(cloud, axis=0)
+            #
+            # # 将点云平移到质心
+            # points_centered = cloud - centroid
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(cloud)
+            cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            final_points = np.asarray(cl.points)
+            points = np.array(final_points)
+            pca = PCA(n_components=3)
+            pca.fit(points)
+            return pca.components_
+
+        obj_path = path.replace('point_cloud.ply', 'centerObj_point_cloud.ply')
+        mkdir_p(os.path.dirname(obj_path))
+
+        if bbox is not None:
+            xyz = self._xyz.detach().cpu().numpy()
+            # find PCA directions
+            pca_components = compute_pca(xyz)
+
+            # Calculate the center and radius of the bounding box
+            center = np.array([(bbox[0] + bbox[1]) / 2, (bbox[2] + bbox[3]) / 2,
+                               (bbox[4] + bbox[5]) / 2
+                               ])
+            center = np.tile(center, (xyz.shape[0], 1))
+            r = max(abs(bbox[0] - bbox[1]), abs(bbox[2] - bbox[3]), abs(bbox[4] - bbox[5])) / 2
+            r = r * 1.5
+
+            # Filter points within the circular region
+            copy = xyz.copy()
+            dis = copy[:, 0] ** 2 - 2 * copy[:, 0] * center[:, 0] + \
+                  copy[:, 1] ** 2 - 2 * copy[:, 1] * center[:, 1] + \
+                  copy[:, 2] ** 2 - 2 * copy[:, 2] * center[:, 2]
+
+            indx = dis < r ** 2
+            xyz = xyz[indx]
+
+            # Fit a plane to the points within the circular region
+            if np.sum(self.colmap_plane_model) == 0:
+                # normal, d = fit_plane_o3d_PCA_interval(xyz, pca_components)
+                # normal, d = fit_plane_o3d_PCA_without_interval(xyz)
+                plane = self.fit_plane(xyz)
+
+            else:
+                plane = self.colmap_plane_model
+            normal = plane[:3]
+            d = plane[3]
+
+            # Calculate the distance from each point to the plane
+            distances = np.dot(xyz, normal) + d
+
+            # Only keep points above the plane
+            # plane_distance = 0.013
+            plane_distance = 0.05
+            indx_above_plane = distances > plane_distance if len(xyz[distances > plane_distance]) > len(
+                xyz[distances < -1 * plane_distance]) else distances < -1 * plane_distance
+            # indx_above_plane = distances > -100
+            xyz = xyz[indx_above_plane]
+
+            # Get remaining attributes for the filtered points
+            normals = np.zeros_like(xyz)
+            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[indx][
+                indx_above_plane]
+            f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[indx][
+                indx_above_plane]
+            opacities = self._opacity.detach().cpu().numpy()[indx][indx_above_plane]
+            scale = self._scaling.detach().cpu().numpy()[indx][indx_above_plane]
+            rotation = self._rotation.detach().cpu().numpy()[indx][indx_above_plane]
+
+            # Filter out points from the largest cluster using DBSCAN
+            xyz, cluster_mask = filter_largest_cluster_dbscan_o3d(xyz)
+
+            # Filter other attributes based on the largest cluster mask
+            f_dc = f_dc[cluster_mask]
+            f_rest = f_rest[cluster_mask]
+            opacities = opacities[cluster_mask]
+            scale = scale[cluster_mask]
+            rotation = rotation[cluster_mask]
+
+            # Get remaining attributes for the filtered points
+            normals = np.zeros_like(xyz)
+
+            dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+            elements = np.empty(xyz.shape[0], dtype=dtype_full)
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+            elements[:] = list(map(tuple, attributes))
+            el = PlyElement.describe(elements, 'vertex')
+        print(f"\tnew ply is saved in {obj_path}")
+        PlyData([el]).write(obj_path)
+
+    def save_ply(self, path, bbox=None):
         mkdir_p(os.path.dirname(path))
 
-        xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        if bbox is not None:
+            xyz = self._xyz.detach().cpu().numpy()
+            center = np.array([(bbox[0] + bbox[1]) / 2, (bbox[2] + bbox[3]) / 2])
+            center = np.tile(center, (xyz.shape[0], 1))
+            r = max(abs(bbox[0] - bbox[1]), abs(bbox[2] - bbox[3])) / 2
+            r = r * 1.5
+            copy = xyz.copy()
+            dis = copy[:, 0] ** 2 - 2 * copy[:, 0] * center[:, 0] + copy[:, 1] ** 2 - 2 * copy[:, 1] * center[:, 1]
+            indx = dis < r ** 2
+            normals = np.zeros_like(xyz)[indx]
+            xyz = xyz[indx]
+            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[indx]
+            f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[indx]
+            opacities = self._opacity.detach().cpu().numpy()[indx]
+            scale = self._scaling.detach().cpu().numpy()[indx]
+            rotation = self._rotation.detach().cpu().numpy()[indx]
+            hist, bins = np.histogram(xyz[:, 2], bins=100)
+            a = np.argmax(hist)
+            hist = hist[a:]
+            bins = bins[a:]
+            if np.sum(hist < 100) > 0:
+                indx = np.where(hist < 100)[0][0]
+                # print(bins[indx])
+                v = bins[indx]
+                indx_re = xyz[:, 2] < v
+                indx_temp = xyz[:, 2] > -0.6
+                indx_re = np.logical_and(indx_re, indx_temp)
+                normals = normals[indx_re]
+                xyz = xyz[indx_re]
+                f_dc = f_dc[indx_re]
+                f_rest = f_rest[indx_re]
+                opacities = opacities[indx_re]
+                scale = scale[indx_re]
+                rotation = rotation[indx_re]
 
-        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+                dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, 'vertex')
-        PlyData([el]).write(path)
+                elements = np.empty(xyz.shape[0], dtype=dtype_full)
+                attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+                elements[:] = list(map(tuple, attributes))
+                el = PlyElement.describe(elements, 'vertex')
+            else:
+                xyz = self._xyz.detach().cpu().numpy()
+                normals = np.zeros_like(xyz)
+                f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+                f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+                opacities = self._opacity.detach().cpu().numpy()
+                scale = self._scaling.detach().cpu().numpy()
+                rotation = self._rotation.detach().cpu().numpy()
+
+                dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+                elements = np.empty(xyz.shape[0], dtype=dtype_full)
+                attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+                elements[:] = list(map(tuple, attributes))
+                el = PlyElement.describe(elements, 'vertex')
+            PlyData([el]).write(path)
+        else:
+            xyz = self._xyz.detach().cpu().numpy()
+            normals = np.zeros_like(xyz)
+            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+            f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+            opacities = self._opacity.detach().cpu().numpy()
+            scale = self._scaling.detach().cpu().numpy()
+            rotation = self._rotation.detach().cpu().numpy()
+
+            dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+            elements = np.empty(xyz.shape[0], dtype=dtype_full)
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+            elements[:] = list(map(tuple, attributes))
+            el = PlyElement.describe(elements, 'vertex')
+            PlyData([el]).write(path)
+
 
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -357,6 +719,9 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        # 计算点到平面的距离
+        # distance_to_plane = torch.abs(torch.sum(self._xyz * self._plane_normal, dim=1) + self._plane_d) / torch.norm(self._plane_normal)
+        # selected_pts_mask = torch.logical_and(selected_pts_mask, distance_to_plane <= 0.5 * (self.bbox_max[2] - self.bbox_min[2]))
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
@@ -380,6 +745,9 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        # 计算点到平面的距离
+        # distance_to_plane = torch.abs(torch.sum(self._xyz * self._plane_normal, dim=1) + self._plane_d) / torch.norm(self._plane_normal)
+        # selected_pts_mask = torch.logical_and(selected_pts_mask, distance_to_plane <= 0.5 * (self.bbox_max[2] - self.bbox_min[2]))
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -402,6 +770,9 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        # 再剔除掉bbox外的点
+        # bbox_out_mask = torch.any(self._xyz < self.bbox_min, dim=1) | torch.any(self._xyz > self.bbox_max, dim=1)
+        # prune_mask = torch.logical_or(prune_mask, bbox_out_mask)
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
